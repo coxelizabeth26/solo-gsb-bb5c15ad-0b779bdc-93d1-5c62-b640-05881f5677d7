@@ -104,6 +104,31 @@ CREATE TABLE IF NOT EXISTS alert_events (
 CREATE INDEX IF NOT EXISTS idx_alert_events_device_metric
     ON alert_events (device_id, metric, id);
 CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, id);
+
+-- 只读归档导出：任务为创建时刻已提交包的不可变快照，续传与校验都只访问这两张表
+CREATE TABLE IF NOT EXISTS export_tasks (
+    export_id     TEXT PRIMARY KEY,
+    device_id     TEXT NOT NULL,
+    from_seq      INTEGER,                    -- null 表示从首包开始
+    to_seq        INTEGER,                    -- null 表示到创建时刻已提交的末包为止
+    page_size     INTEGER NOT NULL,
+    package_count INTEGER NOT NULL,           -- 快照包数
+    first_seq     INTEGER,                    -- 快照首序号；空导出为 null
+    last_seq      INTEGER,                    -- 快照末序号；空导出为 null
+    complete      INTEGER NOT NULL DEFAULT 0, -- 请求范围是否被已提交数据连续完整覆盖
+    content_sha256 TEXT NOT NULL,             -- 全量 NDJSON（按 seq 升序）的 sha256
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_tasks_device ON export_tasks (device_id, created_at);
+
+CREATE TABLE IF NOT EXISTS export_items (
+    export_id  TEXT NOT NULL REFERENCES export_tasks (export_id) ON DELETE CASCADE,
+    item_index INTEGER NOT NULL,             -- 0 起，按 seq 升序
+    seq        INTEGER NOT NULL,
+    line       BLOB NOT NULL,                -- 规范化 NDJSON 行（含行尾换行符）
+    PRIMARY KEY (export_id, item_index)
+);
 """
 
 

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 
 from . import db
 from .alerts import (
@@ -15,6 +15,8 @@ from .alerts import (
     get_rule,
     update_rule,
 )
+from . import exports
+from .exports import ExportError, InvalidCursor
 from .logic import IdempotencyConflict, ingest_package
 from .rollup import RollupError, compute_rollup
 from .schemas import (
@@ -26,6 +28,11 @@ from .schemas import (
     DeviceState,
     DuplicatesResponse,
     DuplicateRecord,
+    ExportCreate,
+    ExportCreateResponse,
+    ExportManifest,
+    ExportVerifyRequest,
+    ExportVerifyResponse,
     GapsResponse,
     IngestResponse,
     PackageIn,
@@ -409,4 +416,103 @@ def get_device_alert_events(
         limit=limit,
         offset=offset,
         events=[AlertEventOut(**dict(r)) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 只读归档导出（NDJSON 分页 + manifest 校验）
+# ---------------------------------------------------------------------------
+
+def _get_export_or_404(conn, export_id: str):
+    task = exports.get_task(conn, export_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"导出任务不存在: {export_id}")
+    return task
+
+
+@app.post("/api/v1/exports", response_model=ExportCreateResponse, status_code=201)
+def post_export(export_in: ExportCreate):
+    """按设备 + seq 范围创建只读快照导出，返回 manifest 与首页游标。
+
+    仅读取创建时刻已提交的包；缓冲、重复、告警数据均不受影响。
+    """
+    with db.ingest_lock, db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (export_in.device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(
+                status_code=404, detail=f"未知设备: {export_in.device_id}"
+            )
+        try:
+            task = exports.create_export(
+                conn,
+                export_in.device_id,
+                export_in.from_seq,
+                export_in.to_seq,
+                export_in.page_size,
+            )
+        except ExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    body = exports.manifest_dict(task)
+    body["next_cursor"] = exports.first_cursor(task)
+    return ExportCreateResponse(**body)
+
+
+@app.get("/api/v1/exports/{export_id}/manifest", response_model=ExportManifest)
+def get_export_manifest(export_id: str):
+    with db.get_conn() as conn:
+        task = _get_export_or_404(conn, export_id)
+        return ExportManifest(**exports.manifest_dict(task))
+
+
+@app.get("/api/v1/exports/{export_id}/pages")
+def get_export_page(
+    export_id: str,
+    cursor: Optional[str] = Query(
+        default=None, description="续传游标；缺省从首页（offset=0）开始"
+    ),
+):
+    """按游标取下一页 NDJSON（每包一行），稳定内容与摘要，可任意重复读取。
+
+    响应头 X-Next-Cursor 给出下一页游标，末页不返回该头并带 X-Export-Done: true。
+    """
+    with db.get_conn() as conn:
+        task = _get_export_or_404(conn, export_id)
+        cursor = cursor or exports.first_cursor(task)
+        try:
+            page = exports.fetch_page(conn, task, cursor)
+        except InvalidCursor as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    headers = {
+        "X-Export-Id": task.export_id,
+        "X-Page-Offset": str(page["offset"]),
+        "X-Package-Count": str(task.package_count),
+        "X-Content-SHA256": task.content_sha256,
+        "X-Export-Done": "true" if page["done"] else "false",
+    }
+    if page["next_cursor"] is not None:
+        headers["X-Next-Cursor"] = page["next_cursor"]
+    return Response(
+        content=b"".join(page["lines"]),
+        media_type="application/x-ndjson",
+        headers=headers,
+    )
+
+
+@app.post(
+    "/api/v1/exports/{export_id}/verify", response_model=ExportVerifyResponse
+)
+def post_export_verify(export_id: str, verify_in: ExportVerifyRequest):
+    """提交导出内容摘要以校验完整性；摘要一致时 valid=true。"""
+    with db.get_conn() as conn:
+        task = _get_export_or_404(conn, export_id)
+        valid = exports.verify_manifest(task, verify_in.content_sha256)
+        manifest = ExportManifest(**exports.manifest_dict(task))
+    return ExportVerifyResponse(
+        valid=valid,
+        expected_sha256=task.content_sha256,
+        received_sha256=verify_in.content_sha256.strip().lower(),
+        manifest=manifest,
     )

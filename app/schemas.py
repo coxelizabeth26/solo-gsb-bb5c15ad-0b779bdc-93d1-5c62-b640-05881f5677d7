@@ -214,3 +214,69 @@ class CurrentAlertOut(BaseModel):
 class CurrentAlertsResponse(BaseModel):
     count: int
     alerts: List[CurrentAlertOut]
+
+
+# ---------------------------------------------------------------------------
+# 只读归档导出
+# ---------------------------------------------------------------------------
+
+class ExportCreate(BaseModel):
+    """创建一次按设备 + seq 范围的只读导出任务。"""
+
+    device_id: str = Field(min_length=1)
+    from_seq: Optional[int] = Field(
+        default=None, ge=1, description="起始序号（含）；缺省从首包开始"
+    )
+    to_seq: Optional[int] = Field(
+        default=None, ge=1, description="结束序号（含）；缺省到创建时刻已提交末包"
+    )
+    page_size: int = Field(
+        default=100, ge=1, le=1000, description="每页 NDJSON 行数"
+    )
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if (
+            self.from_seq is not None
+            and self.to_seq is not None
+            and self.from_seq > self.to_seq
+        ):
+            raise ValueError("from_seq 不能大于 to_seq")
+        return self
+
+
+class ExportManifest(BaseModel):
+    """导出任务清单：范围、包数、首尾序号与规范化内容摘要。"""
+
+    export_id: str
+    device_id: str
+    from_seq: Optional[int]
+    to_seq: Optional[int]
+    page_size: int
+    package_count: int = Field(description="快照中的包数")
+    first_seq: Optional[int] = Field(description="快照首序号；空导出为 null")
+    last_seq: Optional[int] = Field(description="快照末序号；空导出为 null")
+    complete: bool = Field(
+        description="请求的 seq 范围是否被创建时刻已提交数据连续完整覆盖"
+    )
+    content_sha256: str = Field(
+        description="全量 NDJSON（按 seq 升序，逐行 sha256）的 SHA-256"
+    )
+    created_at: str
+
+
+class ExportCreateResponse(ExportManifest):
+    next_cursor: str = Field(description="首页游标（offset=0）")
+
+
+class ExportVerifyRequest(BaseModel):
+    content_sha256: str = Field(
+        min_length=1, description="客户端对导出 NDJSON 内容计算的 SHA-256（十六进制）"
+    )
+
+
+class ExportVerifyResponse(BaseModel):
+    valid: bool
+    expected_sha256: str
+    received_sha256: str
+    manifest: ExportManifest
