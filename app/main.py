@@ -4,9 +4,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 
-from . import db
+from . import db, exports
 from .alerts import (
     AlertRuleConflict,
     AlertRuleError,
@@ -26,6 +26,11 @@ from .schemas import (
     DeviceState,
     DuplicatesResponse,
     DuplicateRecord,
+    ExportCreateRequest,
+    ExportCreateResponse,
+    ExportManifest,
+    ExportVerifyRequest,
+    ExportVerifyResponse,
     GapsResponse,
     IngestResponse,
     PackageIn,
@@ -409,4 +414,115 @@ def get_device_alert_events(
         limit=limit,
         offset=offset,
         events=[AlertEventOut(**dict(r)) for r in rows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 只读归档导出（NDJSON 分页 + manifest 校验）
+# ---------------------------------------------------------------------------
+
+
+def _manifest(row) -> ExportManifest:
+    return ExportManifest(**dict(row))
+
+
+@app.post(
+    "/api/v1/exports",
+    response_model=ExportCreateResponse,
+    status_code=201,
+)
+def post_export(req: ExportCreateRequest):
+    """按设备和 seq 范围创建导出任务，固化快照并返回 manifest 与首页游标。"""
+    with db.get_conn() as conn:
+        try:
+            row = exports.create_export(
+                conn, req.device_id, req.from_seq, req.to_seq, req.page_size
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"未知设备: {req.device_id}"
+            )
+        except exports.ExportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        manifest = _manifest(row)
+    return ExportCreateResponse(
+        manifest=manifest,
+        first_cursor=exports.encode_cursor(manifest.export_id, 0),
+    )
+
+
+@app.get("/api/v1/exports/{export_id}/manifest", response_model=ExportManifest)
+def get_export_manifest(export_id: int):
+    with db.get_conn() as conn:
+        row = exports.get_export(conn, export_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"导出任务不存在: {export_id}"
+            )
+        return _manifest(row)
+
+
+@app.get("/api/v1/exports/{export_id}/pages")
+def get_export_page(
+    export_id: int,
+    cursor: Optional[str] = Query(
+        default=None, description="上一页返回的游标；省略或首次调用时从首页开始"
+    ),
+    limit: Optional[int] = Query(
+        default=None,
+        ge=1,
+        le=1000,
+        description="本页包数上限；缺省使用任务创建时的 page_size",
+    ),
+):
+    """分页下载 NDJSON：每行一个规范化测量包，行以 \\n 分隔且响应以 \\n 结尾。
+
+    分页信息通过响应头返回：
+    X-Export-Id / X-Offset / X-Package-Count / X-Has-More /
+    X-Next-Cursor（末页省略）/ X-Content-Sha256（manifest 摘要）。
+    """
+    with db.get_conn() as conn:
+        try:
+            task, body, offset, page_count, next_cursor = exports.fetch_page(
+                conn, export_id, cursor, limit
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"导出任务不存在: {export_id}"
+            )
+        except exports.CursorError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        page_size = limit if limit is not None else task["page_size"]
+    headers = {
+        "X-Export-Id": str(export_id),
+        "X-Offset": str(offset),
+        "X-Page-Size": str(page_size),
+        "X-Package-Count": str(page_count),
+        "X-Has-More": "true" if next_cursor is not None else "false",
+        "X-Content-Sha256": task["content_sha256"],
+    }
+    if next_cursor is not None:
+        headers["X-Next-Cursor"] = next_cursor
+    return Response(content=body, media_type="application/x-ndjson", headers=headers)
+
+
+@app.post("/api/v1/exports/{export_id}/verify", response_model=ExportVerifyResponse)
+def post_export_verify(export_id: int, req: ExportVerifyRequest):
+    """提交下载内容的 SHA-256 摘要，与 manifest 固化摘要比对以验证完整性。"""
+    with db.get_conn() as conn:
+        try:
+            task, valid, submitted = exports.verify_export(
+                conn, export_id, req.content_sha256
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"导出任务不存在: {export_id}"
+            )
+    return ExportVerifyResponse(
+        export_id=export_id,
+        valid=valid,
+        submitted_sha256=submitted,
+        expected_sha256=task["content_sha256"],
+        package_count=task["package_count"],
+        content_bytes=task["content_bytes"],
     )

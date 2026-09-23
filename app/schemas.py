@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Measurement(BaseModel):
@@ -214,3 +214,75 @@ class CurrentAlertOut(BaseModel):
 class CurrentAlertsResponse(BaseModel):
     count: int
     alerts: List[CurrentAlertOut]
+
+
+# ---------------------------------------------------------------------------
+# 只读归档导出
+# ---------------------------------------------------------------------------
+
+_SHA256_HEX = r"^[0-9a-fA-F]{64}$"
+
+
+class ExportCreateRequest(BaseModel):
+    """创建一次按设备与 seq 范围的归档导出任务。"""
+
+    device_id: str = Field(min_length=1)
+    from_seq: int = Field(ge=1, description="导出范围起点（含）")
+    to_seq: int = Field(ge=1, description="导出范围终点（含）")
+    page_size: int = Field(
+        default=100, ge=1, le=1000, description="每页包数；取页时可用 limit 覆盖"
+    )
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.to_seq < self.from_seq:
+            raise ValueError("to_seq 不能小于 from_seq")
+        return self
+
+
+class ExportManifest(BaseModel):
+    """导出任务清单：范围、包数、首尾序号与规范化内容摘要。"""
+
+    export_id: int
+    device_id: str
+    from_seq: int
+    to_seq: int
+    page_size: int
+    package_count: int = Field(description="快照内的包数")
+    first_seq: int = Field(description="首个导出包序号")
+    last_seq: int = Field(description="末尾导出包序号")
+    content_sha256: str = Field(
+        description="全部页面 NDJSON 字节按序拼接后的 SHA-256（十六进制）"
+    )
+    content_bytes: int = Field(description="导出内容总字节数")
+    created_at: str
+
+
+class ExportCreateResponse(BaseModel):
+    """创建任务的响应：manifest + 首页游标（无数据时不存在，本接口至少 1 个包）。"""
+
+    manifest: ExportManifest
+    first_cursor: Optional[str] = Field(
+        description="首页游标：GET pages 接口不传 cursor 即从该页开始"
+    )
+
+
+class ExportVerifyRequest(BaseModel):
+    """提交客户端复算的导出内容摘要以校验完整性。"""
+
+    content_sha256: str = Field(pattern=_SHA256_HEX, description="64 位十六进制 SHA-256")
+
+    @field_validator("content_sha256", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        # 允许客户端携带前后空白；比较前统一转小写（在 verify_export 中完成）
+        return v.strip() if isinstance(v, str) else v
+
+
+class ExportVerifyResponse(BaseModel):
+    export_id: int
+    valid: bool = Field(description="提交摘要与 manifest 是否一致")
+    submitted_sha256: str = Field(description="归一化（小写去空白）后的提交摘要")
+    expected_sha256: str = Field(description="manifest 中固化的摘要")
+    package_count: int
+    content_bytes: int

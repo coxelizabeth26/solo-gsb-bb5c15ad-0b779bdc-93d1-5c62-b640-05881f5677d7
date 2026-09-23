@@ -104,6 +104,38 @@ CREATE TABLE IF NOT EXISTS alert_events (
 CREATE INDEX IF NOT EXISTS idx_alert_events_device_metric
     ON alert_events (device_id, metric, id);
 CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events (rule_id, id);
+
+-- 只读归档导出任务：创建时固化请求范围内已提交包的不可变快照
+CREATE TABLE IF NOT EXISTS exports (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id     TEXT NOT NULL,
+    from_seq      INTEGER NOT NULL,          -- 请求范围起点（含）
+    to_seq        INTEGER NOT NULL,          -- 请求范围终点（含）
+    page_size     INTEGER NOT NULL,          -- 创建任务时的默认页大小
+    package_count INTEGER NOT NULL,          -- manifest：快照内包数
+    first_seq     INTEGER NOT NULL,          -- manifest：首个包序号
+    last_seq      INTEGER NOT NULL,          -- manifest：末尾包序号
+    content_sha256 TEXT NOT NULL,            -- manifest：全部 NDJSON 字节拼接后的 sha256
+    content_bytes INTEGER NOT NULL,          -- 导出内容总字节数
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (from_seq >= 1),
+    CHECK (to_seq >= from_seq),
+    CHECK (page_size >= 1),
+    CHECK (package_count >= 1)
+);
+
+-- 导出快照：任务创建时从 committed 复制，position 即该包在导出中的 0 基序号。
+-- 与 committed 物理隔离：排水提交只删 buffer 不影响快照，续传结果永远稳定。
+CREATE TABLE IF NOT EXISTS export_items (
+    export_id    INTEGER NOT NULL REFERENCES exports (id) ON DELETE CASCADE,
+    position     INTEGER NOT NULL,          -- 0 基，游标 offset 即作用于此
+    seq          INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,             -- 单行规范化 JSON（不含换行）
+    PRIMARY KEY (export_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_items_seq
+    ON export_items (export_id, seq);
 """
 
 

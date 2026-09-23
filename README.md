@@ -6,7 +6,8 @@
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
 - **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
-- **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
+- **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite；
+- **只读归档导出**：按设备 + seq 范围创建一次性导出任务，返回分页 NDJSON 游标与 manifest（包数、首尾序号、规范化内容 SHA-256），快照不可变、续传稳定，并提供摘要校验接口。
 
 ## 快速开始
 
@@ -17,8 +18,9 @@ docker compose up --build
 ```
 
 这一条命令完成全部初始化：构建镜像 → 容器内安装依赖（`docker-entrypoint.sh`）→
-应用启动钩子自动创建 SQLite 数据库与全部表结构（含告警规则、规则状态、告警事件表）→ 启动服务。
-数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则与事件。
+**显式执行 `db.init_db()` 初始化 SQLite 数据库与全部表结构**（含告警规则、规则状态、告警事件以及归档导出快照表，幂等可重复执行）
+→ 应用启动钩子再次自动建表（双保险）→ 启动服务。
+数据库文件持久化在命名卷 `lab-data`（容器内 `/data/lab.db`），重启不丢规则、事件与导出快照。
 
 服务地址：http://localhost:8000 ，交互式文档：http://localhost:8000/docs
 
@@ -87,6 +89,10 @@ pytest tests/
 | DELETE | `/api/v1/rules/{rule_id}` | 删除规则（历史事件保留） |
 | GET | `/api/v1/alerts` | 当前仍处于告警中的规则（可按 `device_id`/`metric` 过滤） |
 | GET | `/api/v1/devices/{id}/alerts/events` | 按设备、可选指标分页查询触发/恢复事件 |
+| POST | `/api/v1/exports` | 创建只读归档导出任务（按设备 + seq 范围，返回 manifest 与首页游标） |
+| GET | `/api/v1/exports/{id}/manifest` | 获取导出 manifest（包数、首尾序号、内容 SHA-256） |
+| GET | `/api/v1/exports/{id}/pages` | 游标分页下载 NDJSON（`cursor`/`limit`） |
+| POST | `/api/v1/exports/{id}/verify` | 提交下载内容的 SHA-256 摘要校验完整性 |
 
 ## 窗口聚合（Rollup）
 
@@ -242,6 +248,104 @@ curl localhost:8000/api/v1/devices/ph-meter-01/committed    # 已提交序号
 curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 ```
 
+## 只读归档导出（Archive Export）
+
+对一台设备的**已提交（committed）**测量包按 seq 闭区间创建一次性导出任务。导出是
+**只读 + 快照**操作：任务创建时把范围内的包从 `committed` 复制到导出专用快照表
+（`export_items`），此后无论缓冲区如何排水、`committed` 如何增长、是否继续产生重复包
+或告警事件，**同一任务用游标续传得到的页面字节与 manifest 摘要永远不变**；导出全程
+不写 `devices` / `committed` / `buffer` / `duplicates` / `alert_*` 中的任何数据，
+也不驱动告警评估。
+
+> 只能导出创建时刻**已连续提交**的序号（即设备当前已提交区间之内）；缓冲区中的包不导出。
+> 乱序自举设备（首包 seq=10）的已提交区间就是 `[10, …]`，请求越界返回 `422`。
+
+### 1）创建任务
+
+```bash
+curl -X POST localhost:8000/api/v1/exports -H 'Content-Type: application/json' -d '{
+  "device_id": "ph-meter-01",
+  "from_seq": 1,
+  "to_seq": 500,
+  "page_size": 100
+}'
+# => 201
+# {
+#   "manifest": {
+#     "export_id": 1,
+#     "device_id": "ph-meter-01",
+#     "from_seq": 1, "to_seq": 500,
+#     "page_size": 100,
+#     "package_count": 500,
+#     "first_seq": 1, "last_seq": 500,
+#     "content_sha256": "9f2d…（64 位十六进制）",
+#     "content_bytes": 182540,
+#     "created_at": "2026-09-23T03:10:00.000Z"
+#   },
+#   "first_cursor": "eyJlIjoxLCJvIjowfQ"
+# }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `from_seq` / `to_seq` | 导出序号闭区间，需 `1 <= from_seq <= to_seq`，且完全落在设备已提交区间内 |
+| `page_size` | 默认每页包数（1–1000，默认 100）；取页时可用 `limit` 临时覆盖，不改变内容 |
+| `package_count` / `first_seq` / `last_seq` | manifest：包数、首尾序号 |
+| `content_sha256` | manifest：**全部页面 NDJSON 字节按序拼接**后的 SHA-256 |
+| `first_cursor` | 首页游标（等价于从 offset 0 开始） |
+
+错误：设备不存在 → `404`；范围非法或越出已提交区间 → `422`（detail 中给出当前合法范围）。
+
+### 2）游标分页下载 NDJSON
+
+```bash
+curl -i 'localhost:8000/api/v1/exports/1/pages?cursor=eyJlIjoxLCJvIjowfQ'
+# HTTP/1.1 200 OK
+# content-type: application/x-ndjson; charset=utf-8
+# x-export-id: 1
+# x-offset: 0
+# x-page-size: 100
+# x-package-count: 100
+# x-has-more: true
+# x-next-cursor: eyJlIjoxLCJvIjoxMDB9
+# x-content-sha256: 9f2d…
+#
+# {"device_id":"ph-meter-01","measurements":[…],"seq":1,"sent_at":"…"}
+# {"device_id":"ph-meter-01","measurements":[…],"seq":2,"sent_at":"…"}
+# …
+```
+
+- 每行一个测量包的**规范化 JSON**：键排序（`sort_keys`）、非 ASCII 原样保留
+  （`ensure_ascii=False`），与摄入时的规范化规则一致；行以 `\n` 分隔，**每个响应都以
+  `\n` 结尾**，因此各页响应体直接拼接即为完整归档；
+- 首页可省略 `cursor`；之后把上一页响应头 `X-Next-Cursor` 的值原样传回即可续传；
+  末页 `X-Has-More: false` 且不带 `X-Next-Cursor`；
+- 同一游标**任意次重复取、或换 `limit` 重新分页**：页边界可以不同，但所有页面按序拼接
+  后的字节流与 `content_sha256` 必须一致——下载中断后直接重取当前游标即可；
+- `limit` 范围 1–1000；游标无法解析、属于其他任务、offset 越过末页 → `422`，
+  导出任务不存在 → `404`（任务存在性先于游标检查）。
+
+### 3）校验完整性
+
+客户端逐页保存响应体并按下载顺序拼接，本地计算 SHA-256 后提交比对：
+
+```bash
+# 按 X-Next-Cursor 循环取页并按序拼接为 export.ndjson
+sha256sum export.ndjson     # => 9f2d…  export.ndjson
+
+curl -X POST localhost:8000/api/v1/exports/1/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"content_sha256": "9f2d…"}'
+# => 200
+# {"export_id":1,"valid":true,
+#  "submitted_sha256":"9f2d…","expected_sha256":"9f2d…",
+#  "package_count":500,"content_bytes":182540}
+```
+
+提交值接受大写与前后空白（服务端 strip 后统一转小写比对）；摘要不匹配时返回
+`200` 且 `valid: false`（语义为"服务可达但内容不一致"，由客户端决定如何处置）；
+摘要不是 64 位十六进制 → `422`，任务不存在 → `404`。
+
 ## 项目结构
 
 ```
@@ -250,13 +354,15 @@ app/
   logic.py    # 摄入核心：幂等判定、缓冲、排水提交（提交时驱动告警评估）
   alerts.py   # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
   rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
-  db.py       # SQLite 连接与建表（启动时自动执行）
+  exports.py  # 只读归档导出：快照固化、游标编解码、NDJSON 分页、manifest 摘要校验
+  db.py       # SQLite 连接与建表（启动时 / 容器入口自动执行）
   schemas.py  # Pydantic 模型
 tests/
   conftest.py     # 测试数据库隔离（临时文件）
   test_api.py     # 摄入 / 查询接口测试
   test_rollup.py  # 窗口聚合测试
   test_alerts.py  # 阈值告警测试
+  test_exports.py # 只读归档导出测试（快照稳定性、游标越界、摘要校验、只读性）
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```
